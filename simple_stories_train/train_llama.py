@@ -57,13 +57,31 @@ from simple_stories_train.models.model_configs import MODEL_CONFIGS
 from simple_stories_train.utils import (
     REPO_ROOT,
     is_checkpoint_step,
+    load_checkpoint,
     load_config,
     log_generations,
     log_metrics,
     print0,
+    save_checkpoint,
     save_config,
     save_model,
 )
+
+# Config fields that may change when resuming, since they don't affect which updates are applied.
+# batch_size is safe because the number of skipped rows only depends on total_batch_size.
+RESUME_MAY_DIFFER = {
+    "wandb_project",
+    "output_dir",
+    "batch_size",
+    "val_loss_every",
+    "val_max_steps",
+    "sample_every",
+    "device",
+    "compile",
+    "intermediate_checkpoints",
+    "checkpoint_every",
+    "resume_from",
+}
 
 
 class Config(BaseModel):
@@ -139,6 +157,16 @@ class Config(BaseModel):
     )
     intermediate_checkpoints: bool = Field(
         False, description="Save intermediate checkpoints (done at steps 0, 1, 2, 4, 8, ...)?"
+    )
+    checkpoint_every: NonNegativeInt = Field(
+        0,
+        description="Every how many steps to save a resumable checkpoint (weights, optimizer state "
+        "and step) to checkpoints/latest.pt. 0 disables it.",
+    )
+    resume_from: Path | None = Field(
+        None,
+        description="Path to a latest.pt to resume training from. The config must match the "
+        "original run, apart from the fields in RESUME_MAY_DIFFER.",
     )
 
     @model_validator(mode="after")
@@ -273,6 +301,28 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         zero_stage=zero_stage,
     )
 
+    start_step = 1
+    if config.resume_from is not None:
+        resumed_step, saved_config = load_checkpoint(
+            config.resume_from, raw_model, optimizer, device
+        )
+        current_config = config.model_dump(mode="json")
+        mismatched = sorted(
+            key
+            for key in current_config.keys() - RESUME_MAY_DIFFER
+            if current_config[key] != saved_config.get(key)
+        )
+        assert not mismatched, (
+            f"Config differs from the checkpointed run in {mismatched}; resuming would not "
+            f"reproduce it. Pass the same values as the original run."
+        )
+        # Skip the batches already trained on, so the data order matches an uninterrupted run.
+        # ponytail: skips by reading every batch; slice the dataset if resuming gets slow
+        for _ in range(resumed_step * grad_accum_steps):
+            next(train_loader)
+        start_step = resumed_step + 1
+        print0(f"Resumed from {config.resume_from} at step {resumed_step}")
+
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it: int) -> float:
         min_lr = config.learning_rate * config.learning_rate_decay_frac
@@ -313,7 +363,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     train_loader_depleted = False
     timings = []
     generations = []
-    for step in range(1, config.num_iterations + 1):
+    for step in range(start_step, config.num_iterations + 1):
         t0 = time.time()
         last_step = step == config.num_iterations
 
@@ -467,6 +517,20 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             )
         ):
             save_model(checkpoints_dir, raw_model, step=step, wandb_project=config.wandb_project)
+
+        if (
+            checkpoints_dir is not None
+            and master_process
+            and config.checkpoint_every > 0
+            and step % config.checkpoint_every == 0
+        ):
+            save_checkpoint(
+                checkpoints_dir / "latest.pt",
+                raw_model,
+                optimizer,
+                step=step,
+                config_dict=config.model_dump(mode="json"),
+            )
 
         # keep track of smooth timings, last 20 iterations
         if step > 1 and (step > config.num_iterations - 20 or train_loader_depleted):
