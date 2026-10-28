@@ -253,7 +253,6 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    val_loader = iter(val_loader)  # Is this the right way to sample from a Pytorch DataLoader?
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -326,6 +325,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             )  # By creating the iterator anew, we sample the same data each time
             with torch.no_grad():
                 val_loss = 0.0
+                num_val_batches = 0
                 for _ in range(config.val_max_steps):
                     try:
                         bat = next(val_loader_iter)["input_ids"].to(torch.int)
@@ -337,7 +337,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
                     x, y = x.to(device), y.to(device)
                     _, loss = model(x, y, return_logits=False)
                     val_loss += loss.item()
-                val_loss /= config.val_max_steps
+                    num_val_batches += 1
+                if num_val_batches == 0:
+                    print0("No validation batches were processed. Returning NaN for val_loss.")
+                    val_loss = float("nan")
+                else:
+                    val_loss /= num_val_batches
             # log to wandb
             if config.wandb_project is not None and master_process:
                 log_metrics(step, {"val_loss": val_loss})
