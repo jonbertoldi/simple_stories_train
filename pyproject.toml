@@ -5,7 +5,7 @@ description = "Training of small LM models for SimpleStories"
 requires-python = ">=3.11"
 readme = "README.md"
 dependencies = [
-    "torch<2.6.0",
+    "torch>=2.7",
     "torchvision",
     "pydantic",
     "wandb",
@@ -30,6 +30,19 @@ dev = [
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["simple_stories_train*"]
+
+# CUDA 12.8 builds on Linux, needed for Blackwell GPUs (RTX 50xx, sm_120). macOS uses PyPI.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 line-length = 100
