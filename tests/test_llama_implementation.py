@@ -62,7 +62,7 @@ def test_rotary_embedding_implementation() -> None:
     position_ids = torch.arange(seq_length).expand(batch_size, -1)
 
     hf_cos, hf_sin = hf_implementation.forward(q_hf, position_ids)
-    q_hf_rot, k_hf_rot = apply_rotary_pos_emb(q_hf, k_hf, hf_cos, hf_sin, position_ids)
+    q_hf_rot, k_hf_rot = apply_rotary_pos_emb(q_hf, k_hf, hf_cos, hf_sin)
 
     q_custom = q_hf.detach().clone()
     k_custom = k_hf.detach().clone()
@@ -117,6 +117,8 @@ def test_local_pt_model_loading() -> None:
 
 def test_generation_with_eos_token_id() -> None:
     """Test the generate method with EOS token for both single and batched sequences"""
+    # Unseeded, a random model sometimes samples no EOS in 20 tokens and the test fails
+    torch.manual_seed(0)
     config = LlamaConfig(
         block_size=128,
         vocab_size=4,
