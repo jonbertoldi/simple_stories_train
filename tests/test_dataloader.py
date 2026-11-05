@@ -1,6 +1,34 @@
 import torch
+from datasets import Dataset
+from tokenizers import Tokenizer
 
-from simple_stories_train.dataloaders import DatasetConfig, create_data_loader
+from simple_stories_train.dataloaders import (
+    DatasetConfig,
+    create_data_loader,
+    tokenize_and_concatenate,
+)
+
+
+def test_tokenize_and_concatenate_puts_eos_only_between_stories():
+    tokenizer = Tokenizer.from_file("simple_stories_train/tokenizer/simplestories-4096.json")
+    eos_id = tokenizer.token_to_id("[EOS]")
+    stories = [
+        "The little girl ran home.",
+        "A brave knight found a shiny sword in the cave.",
+        "The stars twinkled above the quiet village at night.",
+        "Tom and his dog played in the green park all day.",
+    ]
+    seq_len = 8
+
+    out = tokenize_and_concatenate(
+        Dataset.from_dict({"story": stories}), tokenizer, max_length=seq_len, num_proc=1
+    )
+
+    expected = []
+    for story in stories:
+        expected += tokenizer.encode(story.lower(), add_special_tokens=False).ids + [eos_id]
+    expected = expected[: len(expected) // seq_len * seq_len]
+    assert torch.cat(list(out["input_ids"])).tolist() == expected
 
 
 def test_dataloader_with_ddp():

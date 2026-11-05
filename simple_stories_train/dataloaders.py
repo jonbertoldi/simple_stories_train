@@ -54,9 +54,8 @@ def tokenize_and_concatenate(
 ) -> Dataset:
     """Helper function to tokenizer and concatenate a dataset of text. This converts the text to
     tokens, concatenates them (separated by EOS tokens) and then reshapes them into a 2D array of
-    shape (____, sequence_length), dropping the last batch. Tokenizers are much faster if
-    parallelised, so we chop the string into 20, feed it into the tokenizer, in parallel with
-    padding, then remove padding at the end.
+    shape (____, sequence_length), dropping the last batch. Each text is tokenized on its own
+    (in parallel, via encode_batch), so no word is split and EOS appears only between texts.
 
     NOTE: Adapted from
     https://github.com/TransformerLensOrg/TransformerLens/blob/main/transformer_lens/utils.py#L267
@@ -95,26 +94,16 @@ def tokenize_and_concatenate(
         str,
         NDArray[np.signedinteger[Any]],
     ]:
-        padding_token_id = 0
-        tokenizer.enable_padding(pad_id=padding_token_id)
-
         text = examples[column_name]
-        # Concatenate all the text into a single string, separated by EOS tokens
-        full_text = "[EOS]".join(text)
-
-        # Split the text into chunks for parallel tokenization
-        num_chunks = 20
-        chunk_length = (len(full_text) - 1) // num_chunks + 1
-        chunks = [full_text[i * chunk_length : (i + 1) * chunk_length] for i in range(num_chunks)]
-
-        # Tokenize the chunks using the Tokenizer library
         if to_lower:
-            chunks = [chunk.lower().replace("[eos]", "[EOS]") for chunk in chunks]
-        tokens = [tokenizer.encode(chunk).ids for chunk in chunks]  # Get token IDs for each chunk
-        tokens = np.concatenate(tokens)  # Flatten the list of token IDs
+            text = [story.lower() for story in text]
 
-        # Drop padding tokens (if applicable)
-        tokens = tokens[tokens != padding_token_id]
+        # Tokenize each story on its own (encode_batch runs in parallel) and end each one with EOS.
+        # Encoding chunks of the joined text instead would split words at the chunk edges, and the
+        # tokenizer's post-processor would add a spurious EOS at the end of every chunk.
+        eos_token_id = tokenizer.token_to_id("[EOS]")
+        encodings = tokenizer.encode_batch(text, add_special_tokens=False)
+        tokens = np.array([i for enc in encodings for i in [*enc.ids, eos_token_id]])
 
         # Calculate number of batches and adjust the tokens accordingly
         num_tokens = len(tokens)
