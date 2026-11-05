@@ -135,7 +135,7 @@ class Config(BaseModel):
     warmup_iters: NonNegativeInt = Field(
         0, description="Number of iterations to warmup the learning rate"
     )
-    learning_rate_decay_frac: PositiveFloat = Field(
+    learning_rate_decay_frac: NonNegativeFloat = Field(
         1.0, ge=0, le=1, description="Fraction of lr to decay to. 0 decays to 0, 1 doesn't decay"
     )
     weight_decay: NonNegativeFloat = Field(0.1, description="Weight decay")
