@@ -291,6 +291,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     if ddp:
         model: nn.Module = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
+    # torch.compile wraps the model too; unwrap it so checkpoints don't get "_orig_mod." keys
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(
