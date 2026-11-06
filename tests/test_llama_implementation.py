@@ -1,12 +1,14 @@
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 from transformers import LlamaConfig as HFLlamaConfig
+from transformers import LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb
 
 from simple_stories_train.models.llama import CausalSelfAttention as CustomCausalSelfAttention
-from simple_stories_train.models.llama import Llama, LlamaConfig
+from simple_stories_train.models.llama import Llama, LlamaConfig, convert_hf_llama_state_dict
 
 
 def test_rotary_embedding_implementation() -> None:
@@ -62,7 +64,7 @@ def test_rotary_embedding_implementation() -> None:
     position_ids = torch.arange(seq_length).expand(batch_size, -1)
 
     hf_cos, hf_sin = hf_implementation.forward(q_hf, position_ids)
-    q_hf_rot, k_hf_rot = apply_rotary_pos_emb(q_hf, k_hf, hf_cos, hf_sin, position_ids)
+    q_hf_rot, k_hf_rot = apply_rotary_pos_emb(q_hf, k_hf, hf_cos, hf_sin)
 
     q_custom = q_hf.detach().clone()
     k_custom = k_hf.detach().clone()
@@ -115,8 +117,71 @@ def test_local_pt_model_loading() -> None:
             assert original_output.shape == loaded_output.shape
 
 
+def test_convert_hf_llama_state_dict_matches_transformers_logits() -> None:
+    """A transformers Llama (the layout of the published SimpleStories models) converted to our
+    implementation must produce the same logits, and load strictly."""
+    torch.manual_seed(0)
+    hf_model = LlamaForCausalLM(
+        HFLlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=40,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=16,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            tie_word_embeddings=True,
+        )
+    ).eval()
+    config = LlamaConfig(
+        block_size=16,
+        vocab_size=64,
+        n_layer=2,
+        n_head=4,
+        n_embd=32,
+        n_intermediate=40,
+        rotary_dim=32 // 4,
+        n_ctx=16,
+        n_key_value_heads=2,
+        flash_attention=True,
+    )
+    model = Llama(config).eval()
+    result = model.load_state_dict(convert_hf_llama_state_dict(hf_model.state_dict()), strict=False)
+    assert not result.unexpected_keys
+    assert all(k.endswith(("rotary_sin", "rotary_cos")) for k in result.missing_keys)
+
+    tokens = torch.randint(0, 64, (2, 16))
+    with torch.no_grad():
+        ours, _ = model(tokens)
+        theirs = hf_model(tokens).logits
+    torch.testing.assert_close(ours, theirs, rtol=1e-4, atol=1e-4)
+
+
+def test_from_pretrained_rejects_mismatched_state_dict() -> None:
+    """Weights under unknown names must raise, not leave the model at its random init."""
+    config = LlamaConfig(
+        block_size=16,
+        vocab_size=64,
+        n_layer=1,
+        n_head=2,
+        n_embd=8,
+        rotary_dim=4,
+        n_key_value_heads=1,
+        flash_attention=True,
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "renamed.pt"
+        torch.save({"some." + k: v for k, v in Llama(config).state_dict().items()}, path)
+        with pytest.raises(ValueError, match="does not match"):
+            Llama.from_pretrained(str(path), config)
+
+
 def test_generation_with_eos_token_id() -> None:
     """Test the generate method with EOS token for both single and batched sequences"""
+    # Unseeded, a random model sometimes samples no EOS in 20 tokens and the test fails
+    torch.manual_seed(0)
     config = LlamaConfig(
         block_size=128,
         vocab_size=4,

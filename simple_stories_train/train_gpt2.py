@@ -11,10 +11,12 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
 1 GPU:
-python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 \\
+    --compile=1 --tensorcores=1 --dtype=bfloat16
 you can also turn on flash-attention by appending --flash=1
 4 GPU:
-torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 \\
+    --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
 
 This implementation is verbatim from
 - llm.c, licensed under MIT ((c) 2024 Andrei Karpathy).
@@ -104,7 +106,8 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate query, key, values for all heads in batch
+        # and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
@@ -251,7 +254,7 @@ class GPT(nn.Module):
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         from transformers import GPT2LMHeadModel
 
-        print("loading weights from pretrained gpt: %s" % model_type)
+        print(f"loading weights from pretrained gpt: {model_type}")
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
@@ -289,7 +292,8 @@ class GPT(nn.Module):
             "mlp.c_fc.weight",
             "mlp.c_proj.weight",
         ]
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # basically the openai checkpoints use a "Conv1D" module,
+        # but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), (
             f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
@@ -324,10 +328,12 @@ class GPT(nn.Module):
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print0(
-            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+            f"num decayed parameter tensors: {len(decay_params)}, "
+            f"with {num_decay_params:,} parameters"
         )
         print0(
-            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, "
+            f"with {num_nodecay_params:,} parameters"
         )
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
@@ -393,7 +399,8 @@ def _peek_data_shard(filename):
         print("ERROR: magic number mismatch in the data .bin file!")
         print("---> HINT: Are you passing in a correct file with --input_bin?")
         print(
-            "---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README"
+            "---> HINT: Dataset encoding changed recently, "
+            "re-run data prepro or refer again to README"
         )
         print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
@@ -772,7 +779,8 @@ if __name__ == "__main__":
     print(f"using device: {device}")
     device_type = "cuda" if "cuda" in device else "cpu"
 
-    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    # calculate gradient accumulation from the desired total batch size
+    # and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
@@ -939,7 +947,7 @@ if __name__ == "__main__":
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+                    f.write(f"s:{step:d} tel:{val_loss:f}\n")
 
         # once in a while perform model inference on the master process
         if (
@@ -947,7 +955,8 @@ if __name__ == "__main__":
         ) and master_process:
             model.eval()
             # before we end, let's also do one round of inference
-            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+            # we'll kick off the generation with "<|endoftext|>",
+            # which designates the start of a new sequence
             start_ids = [enc.eot_token]
             xg = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
             max_new_tokens = 32
@@ -1017,12 +1026,13 @@ if __name__ == "__main__":
         # the 0th iteration is often an outlier (much slower) => skip logging it
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
         print0(
-            f"step {step:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+            f"step {step:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | "
+            f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
         )
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
+                f.write(f"s:{step:d} trl:{lossf:f}\n")
 
         if checkpoints_dir is not None and is_checkpoint_step(step):
             save_model_and_config(checkpoints_dir, raw_model, step=step)

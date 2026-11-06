@@ -57,13 +57,31 @@ from simple_stories_train.models.model_configs import MODEL_CONFIGS
 from simple_stories_train.utils import (
     REPO_ROOT,
     is_checkpoint_step,
+    load_checkpoint,
     load_config,
     log_generations,
     log_metrics,
     print0,
+    save_checkpoint,
     save_config,
     save_model,
 )
+
+# Config fields that may change when resuming, since they don't affect which updates are applied.
+# batch_size is safe because the number of skipped rows only depends on total_batch_size.
+RESUME_MAY_DIFFER = {
+    "wandb_project",
+    "output_dir",
+    "batch_size",
+    "val_loss_every",
+    "val_max_steps",
+    "sample_every",
+    "device",
+    "compile",
+    "intermediate_checkpoints",
+    "checkpoint_every",
+    "resume_from",
+}
 
 
 class Config(BaseModel):
@@ -117,7 +135,7 @@ class Config(BaseModel):
     warmup_iters: NonNegativeInt = Field(
         0, description="Number of iterations to warmup the learning rate"
     )
-    learning_rate_decay_frac: PositiveFloat = Field(
+    learning_rate_decay_frac: NonNegativeFloat = Field(
         1.0, ge=0, le=1, description="Fraction of lr to decay to. 0 decays to 0, 1 doesn't decay"
     )
     weight_decay: NonNegativeFloat = Field(0.1, description="Weight decay")
@@ -139,6 +157,16 @@ class Config(BaseModel):
     )
     intermediate_checkpoints: bool = Field(
         False, description="Save intermediate checkpoints (done at steps 0, 1, 2, 4, 8, ...)?"
+    )
+    checkpoint_every: NonNegativeInt = Field(
+        0,
+        description="Every how many steps to save a resumable checkpoint (weights, optimizer state "
+        "and step) to checkpoints/latest.pt. 0 disables it.",
+    )
+    resume_from: Path | None = Field(
+        None,
+        description="Path to a latest.pt to resume training from. The config must match the "
+        "original run, apart from the fields in RESUME_MAY_DIFFER.",
     )
 
     @model_validator(mode="after")
@@ -190,10 +218,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     print(f"using device: {device}")
     device_type = "cuda" if "cuda" in device else "cpu"
 
-    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    # calculate gradient accumulation from the desired total batch size
+    # and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert config.total_batch_size % tokens_per_fwdbwd == 0, (
-        f"Mismatch between batch size and tokens {config.total_batch_size} % {tokens_per_fwdbwd} != 0"
+        f"Mismatch between batch size and tokens "
+        f"{config.total_batch_size} % {tokens_per_fwdbwd} != 0"
     )
     grad_accum_steps = config.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {config.total_batch_size}")
@@ -229,7 +259,10 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     model.to(device)
     if config.compile:
         if device_type == "cpu":
-            warnings.warn("compile may not be compatible with cpu, use `--compile=False` if issues")
+            warnings.warn(
+                "compile may not be compatible with cpu, use `--compile=False` if issues",
+                stacklevel=2,
+            )
         if hasattr(torch_inductor_config, "coordinate_descent_tuning"):
             torch_inductor_config.coordinate_descent_tuning = True  # suggested by @Chillee
         print0("compiling the model...")
@@ -253,7 +286,6 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    val_loader = iter(val_loader)  # Is this the right way to sample from a Pytorch DataLoader?
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -264,6 +296,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     if ddp:
         model: nn.Module = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
+    # torch.compile wraps the model too; unwrap it so checkpoints don't get "_orig_mod." keys
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(
@@ -273,6 +307,28 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         device_type=device,
         zero_stage=zero_stage,
     )
+
+    start_step = 1
+    if config.resume_from is not None:
+        resumed_step, saved_config = load_checkpoint(
+            config.resume_from, raw_model, optimizer, device
+        )
+        current_config = config.model_dump(mode="json")
+        mismatched = sorted(
+            key
+            for key in current_config.keys() - RESUME_MAY_DIFFER
+            if current_config[key] != saved_config.get(key)
+        )
+        assert not mismatched, (
+            f"Config differs from the checkpointed run in {mismatched}; resuming would not "
+            f"reproduce it. Pass the same values as the original run."
+        )
+        # Skip the batches already trained on, so the data order matches an uninterrupted run.
+        # ponytail: skips by reading every batch; slice the dataset if resuming gets slow
+        for _ in range(resumed_step * grad_accum_steps):
+            next(train_loader)
+        start_step = resumed_step + 1
+        print0(f"Resumed from {config.resume_from} at step {resumed_step}")
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it: int) -> float:
@@ -314,7 +370,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     train_loader_depleted = False
     timings = []
     generations = []
-    for step in range(1, config.num_iterations + 1):
+    for step in range(start_step, config.num_iterations + 1):
         t0 = time.time()
         last_step = step == config.num_iterations
 
@@ -326,6 +382,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             )  # By creating the iterator anew, we sample the same data each time
             with torch.no_grad():
                 val_loss = 0.0
+                num_val_batches = 0
                 for _ in range(config.val_max_steps):
                     try:
                         bat = next(val_loader_iter)["input_ids"].to(torch.int)
@@ -337,7 +394,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
                     x, y = x.to(device), y.to(device)
                     _, loss = model(x, y, return_logits=False)
                     val_loss += loss.item()
-                val_loss /= config.val_max_steps
+                    num_val_batches += 1
+                if num_val_batches == 0:
+                    print0("No validation batches were processed. Returning NaN for val_loss.")
+                    val_loss = float("nan")
+                else:
+                    val_loss /= num_val_batches
             # log to wandb
             if config.wandb_project is not None and master_process:
                 log_metrics(step, {"val_loss": val_loss})
@@ -345,7 +407,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+                    f.write(f"s:{step:d} tel:{val_loss:f}\n")
 
         # once in a while perform model inference on the master process
         if (
@@ -450,7 +512,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("step:%d loss:%f\n" % (step, lossf))
+                f.write(f"step:{step:d} loss:{lossf:f}\n")
 
         if (
             checkpoints_dir is not None
@@ -462,6 +524,20 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             )
         ):
             save_model(checkpoints_dir, raw_model, step=step, wandb_project=config.wandb_project)
+
+        if (
+            checkpoints_dir is not None
+            and master_process
+            and config.checkpoint_every > 0
+            and step % config.checkpoint_every == 0
+        ):
+            save_checkpoint(
+                checkpoints_dir / "latest.pt",
+                raw_model,
+                optimizer,
+                step=step,
+                config_dict=config.model_dump(mode="json"),
+            )
 
         # keep track of smooth timings, last 20 iterations
         if step > 1 and (step > config.num_iterations - 20 or train_loader_depleted):

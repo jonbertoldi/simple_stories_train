@@ -51,6 +51,50 @@ def save_model(
         print0(f"Saved model to wandb: {str(model_file)}")
 
 
+def _unwrap(model: nn.Module) -> nn.Module:
+    # Strip the DDP and torch.compile wrappers so state_dict keys match the plain model
+    model = model.module if hasattr(model, "module") else model
+    return getattr(model, "_orig_mod", model)
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    config_dict: dict[str, Any],
+) -> None:
+    """Save everything needed to resume training: weights, optimizer state, the last step and
+    the config the run was started with.
+
+    Writes to a temporary file and renames it, so a crash mid-write never leaves a corrupt
+    checkpoint in place of the previous one.
+    """
+    checkpoint = {
+        "model": _unwrap(model).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "config": config_dict,
+    }
+    tmp_path = path.with_suffix(".tmp")
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+    print0(f"Saved checkpoint at step {step} to {path}")
+
+
+def load_checkpoint(
+    path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, device: str
+) -> tuple[int, dict[str, Any]]:
+    """Restore weights and optimizer state saved by `save_checkpoint`.
+
+    Returns the saved step and the config the checkpointed run was started with.
+    """
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    _unwrap(model).load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["step"], checkpoint["config"]
+
+
 def log_metrics(step: int, metrics: dict[str, Any]) -> None:
     wandb.log(metrics, step=step)
 
