@@ -139,7 +139,10 @@ def write_evalfile(filename, datas):
 
 
 enc = tiktoken.get_encoding("gpt2")
-encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+
+
+def encode(s):
+    return enc.encode(s, allowed_special={"<|endoftext|>"})
 
 
 def download():
@@ -159,7 +162,8 @@ def download():
 
 def tokenize():
     data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
-    text = open(data_filename).read()
+    with open(data_filename) as f:
+        text = f.read()
     # let's treat every person's statement in the dialog as a separate document
     text = "<|endoftext|>" + text
     text = text.replace("\n\n", "\n\n<|endoftext|>")

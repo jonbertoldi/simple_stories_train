@@ -218,10 +218,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     print(f"using device: {device}")
     device_type = "cuda" if "cuda" in device else "cpu"
 
-    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    # calculate gradient accumulation from the desired total batch size
+    # and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert config.total_batch_size % tokens_per_fwdbwd == 0, (
-        f"Mismatch between batch size and tokens {config.total_batch_size} % {tokens_per_fwdbwd} != 0"
+        f"Mismatch between batch size and tokens "
+        f"{config.total_batch_size} % {tokens_per_fwdbwd} != 0"
     )
     grad_accum_steps = config.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {config.total_batch_size}")
@@ -257,7 +259,10 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     model.to(device)
     if config.compile:
         if device_type == "cpu":
-            warnings.warn("compile may not be compatible with cpu, use `--compile=False` if issues")
+            warnings.warn(
+                "compile may not be compatible with cpu, use `--compile=False` if issues",
+                stacklevel=2,
+            )
         if hasattr(torch_inductor_config, "coordinate_descent_tuning"):
             torch_inductor_config.coordinate_descent_tuning = True  # suggested by @Chillee
         print0("compiling the model...")
@@ -402,7 +407,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+                    f.write(f"s:{step:d} tel:{val_loss:f}\n")
 
         # once in a while perform model inference on the master process
         if (
@@ -507,7 +512,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("step:%d loss:%f\n" % (step, lossf))
+                f.write(f"step:{step:d} loss:{lossf:f}\n")
 
         if (
             checkpoints_dir is not None

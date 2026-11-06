@@ -82,7 +82,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head  # Head size
         self.n_key_value_heads = config.n_key_value_heads
         self.repeat_kv_heads = config.n_head // config.n_key_value_heads  # Will be 1 if not GQA
-        self.rotary_dim = self.head_dim  # Align rotary_dim with head_dim for simplicity here, different from our original intention
+        # Align rotary_dim with head_dim for simplicity here, different from our original intention
+        self.rotary_dim = self.head_dim
         self.rotary_adjacent_pairs = config.rotary_adjacent_pairs
         self.rotary_base = config.rotary_base
         self.n_ctx = config.n_ctx  # Max context length for precomputation
@@ -355,7 +356,6 @@ class Llama(nn.Module):
         targets: Float[Tensor, "batch pos vocab"] | None = None,
         return_logits=True,
     ) -> tuple[Float[Tensor, "batch pos"] | None, Float[Tensor, ""] | None]:
-        device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -412,7 +412,7 @@ class Llama(nn.Module):
 
         # Remove rotary_sin and rotary_cos from state_dict to regenerate them
         keys_to_remove = [
-            k for k in state_dict.keys() if k.endswith("rotary_sin") or k.endswith("rotary_cos")
+            k for k in state_dict if k.endswith("rotary_sin") or k.endswith("rotary_cos")
         ]
         for k in keys_to_remove:
             state_dict.pop(k)
@@ -429,7 +429,7 @@ class Llama(nn.Module):
             )
 
         # Regenerate rotary_sin and rotary_cos for each attention layer
-        for layer_idx, block in enumerate(model.transformer.h):
+        for _layer_idx, block in enumerate(model.transformer.h):
             attn = block.attn
             sin, cos = attn.calculate_sin_cos_rotary(
                 rotary_dim=attn.rotary_dim,
@@ -465,10 +465,12 @@ class Llama(nn.Module):
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print0(
-            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+            f"num decayed parameter tensors: {len(decay_params)}, "
+            f"with {num_decay_params:,} parameters"
         )
         print0(
-            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, "
+            f"with {num_nodecay_params:,} parameters"
         )
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
