@@ -15,6 +15,42 @@ from torch.nn import functional as F
 from simple_stories_train.utils import print0
 
 
+def convert_hf_llama_state_dict(hf_state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Rename a transformers LlamaForCausalLM state dict to this implementation's names.
+
+    The published SimpleStories models use the transformers layout. It matches this model when
+    rotary_adjacent_pairs is False (transformers' rotate_half convention): k and v are fused into
+    kv_attn, and the embedding is tied to lm_head.
+    """
+    renames = {
+        "input_layernorm": "rms_1",
+        "post_attention_layernorm": "rms_2",
+        "self_attn.q_proj": "attn.q_attn",
+        "self_attn.o_proj": "attn.c_proj",
+        "mlp.gate_proj": "mlp.gate_proj",
+        "mlp.up_proj": "mlp.up_proj",
+        "mlp.down_proj": "mlp.down_proj",
+    }
+    wte = hf_state_dict["model.embed_tokens.weight"]
+    state_dict = {
+        "transformer.wte.weight": wte,
+        "lm_head.weight": hf_state_dict.get("lm_head.weight", wte),
+        "transformer.rms_f.weight": hf_state_dict["model.norm.weight"],
+    }
+    n_layer = 1 + max(int(k.split(".")[2]) for k in hf_state_dict if k.startswith("model.layers."))
+    for i in range(n_layer):
+        hf, ours = f"model.layers.{i}.", f"transformer.h.{i}."
+        for hf_name, our_name in renames.items():
+            state_dict[ours + our_name + ".weight"] = hf_state_dict[hf + hf_name + ".weight"]
+        state_dict[ours + "attn.kv_attn.weight"] = torch.cat(
+            [
+                hf_state_dict[hf + "self_attn.k_proj.weight"],
+                hf_state_dict[hf + "self_attn.v_proj.weight"],
+            ]
+        )
+    return state_dict
+
+
 class LlamaConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     block_size: int = 1024
@@ -354,15 +390,18 @@ class Llama(nn.Module):
                     repo_id=model_path_or_id, filename="model.safetensors"
                 )
                 state_dict = load_file(weights_path)
-                converted_state_dict = {}
-                for k, v in state_dict.items():
-                    k = k.replace("llama.", "")
-                    if k == "lm_head.weight":
-                        converted_state_dict["lm_head.weight"] = v
-                        converted_state_dict["transformer.wte.weight"] = v
-                    else:
-                        converted_state_dict[k] = v
-                state_dict = converted_state_dict
+                if "model.embed_tokens.weight" in state_dict:
+                    state_dict = convert_hf_llama_state_dict(state_dict)
+                else:
+                    converted_state_dict = {}
+                    for k, v in state_dict.items():
+                        k = k.replace("llama.", "")
+                        if k == "lm_head.weight":
+                            converted_state_dict["lm_head.weight"] = v
+                            converted_state_dict["transformer.wte.weight"] = v
+                        else:
+                            converted_state_dict[k] = v
+                    state_dict = converted_state_dict
             except Exception as err:
                 raise ValueError(
                     f"Error loading model from HuggingFace Hub: {str(err)}. "
@@ -378,8 +417,16 @@ class Llama(nn.Module):
         for k in keys_to_remove:
             state_dict.pop(k)
 
-        # Load state dict (ignoring rotary buffers)
-        model.load_state_dict(state_dict, strict=False)
+        # Load state dict (ignoring rotary buffers, which are regenerated below)
+        result = model.load_state_dict(state_dict, strict=False)
+        missing = [k for k in result.missing_keys if not k.endswith(("rotary_sin", "rotary_cos"))]
+        if strict and (missing or result.unexpected_keys):
+            # Without this check, weights saved under other names load nothing and the model
+            # stays at its random init, silently
+            raise ValueError(
+                f"State dict does not match the model. Missing: {missing}. "
+                f"Unexpected: {result.unexpected_keys}."
+            )
 
         # Regenerate rotary_sin and rotary_cos for each attention layer
         for layer_idx, block in enumerate(model.transformer.h):
