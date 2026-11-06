@@ -6,6 +6,9 @@ with different settings are compared on exactly the same tokens.
 
 Usage:
     python simple_stories_train/evaluate.py out/run1_5M/<timestamp> out/run2_11M/<timestamp>
+
+An argument that is not a local directory is loaded from the HuggingFace Hub instead, e.g.
+SimpleStories/SimpleStories-30M, to compare against the published models.
 """
 
 import math
@@ -40,6 +43,18 @@ def load_run(run_dir: Path, step: int | None, device: str) -> tuple[Llama, dict[
     return model.to(device).eval(), config, step
 
 
+def load_hub_model(model_id: str, device: str) -> tuple[Llama, dict[str, Any]]:
+    """Load a published model such as SimpleStories/SimpleStories-30M (size from the id suffix).
+
+    It is evaluated on the val split of the repo's own config, which uses the same dataset and
+    tokenizer as the published SimpleStories models.
+    """
+    model = Llama.from_pretrained(model_id, MODEL_CONFIGS[model_id.rsplit("-", 1)[1]])
+    with open(PACKAGE_DIR / "35M_config.yaml") as f:
+        config = yaml.safe_load(f)
+    return model.to(device).eval(), config
+
+
 @torch.no_grad()
 def mean_loss(model: Llama, loader: DataLoader[Any], device: str) -> tuple[float, int]:
     # Same precision as the val loss during training: bf16 autocast on CUDA only
@@ -70,8 +85,13 @@ def main(
             device = "mps"
 
     print(f"{'run':<60} {'step':>6} {'loss':>7} {'ppl':>6}")
+    used_step: int | str
     for run_dir in map(Path, run_dirs):
-        model, config, used_step = load_run(run_dir, step, device)
+        if run_dir.exists():
+            model, config, used_step = load_run(run_dir, step, device)
+        else:
+            model, config = load_hub_model(str(run_dir), device)
+            used_step = "hub"
         data_config = DatasetConfig(**config["val_dataset_config"])
         data_config = data_config.model_copy(
             update={
